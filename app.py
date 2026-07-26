@@ -159,6 +159,7 @@ def on_state_update(state: dict):
 # 页面路由
 # ---------------------------------------------------------------------------
 
+@app.route("/")
 @app.route("/btc-enhancer/")
 def index():
     """仪表盘主页"""
