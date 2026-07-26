@@ -38,7 +38,8 @@ DEFAULT_CONFIG = {
     "rv_max": 0.05,        # 日化 RV 上限 5.0%
     "rv_update_interval_minutes": 15,  # RV 更新间隔（分钟，兜底用；成交/方案A触发实时更新）
     "poll_interval": 30,
-    "cooldown_seconds": 60,          # 交易冷却期（秒）
+    "cooldown_seconds": 60,
+    "stale_threshold": 0.5,          # 交易冷却期（秒）
     "instrument_name": "BTC_USDC",
     "index_name": "btc_usdc",
     "min_poll_balance_usdc": 200,   # 资金保护阈值 $200
@@ -96,7 +97,7 @@ class StrategyEngine:
         self.total_trades = 0
         self.btc_cost_basis = 0.0
         self._cooldown_until = 0.0        # 防频繁交易的冷却时间（秒时间戳）
-        self._cooldown_seconds = 180       # 冷静期：每次成交后暂停 3 分钟
+        self._cooldown_seconds = self.cfg.get("cooldown_seconds", 180)  # 冷静期：每次成交后暂停
         self._trading_enabled = False      # 交易开关：就绪后默认不交易，用户点击"启动"才开
         self.open_orders: list[dict] = []  # 当前挂单列表
         self._our_buy_id: Optional[str] = None   # 我们挂的买入单 ID
@@ -106,6 +107,7 @@ class StrategyEngine:
         self._ws: Optional[DeribitWSClient] = None
         self._ws_enabled = False
         self._last_ws_index_update = 0.0  # 最新一次从 WS 拿到指数价的时间戳
+        self._last_ws_balance_update = 0.0  # 最新一次从 WS 拿到余额的时间戳
         self._last_ws_check_ts = 0.0     # 最后一次检查 WS 连接的时间戳
 
         logger.info("StrategyEngine v2 created")
@@ -122,8 +124,7 @@ class StrategyEngine:
 
         安全策略：
         1. 先写临时文件再 rename（原子写入，防止写一半崩溃）
-        2. 保存后 git commit 到仓库（历史版本可回滚）
-        3. 保留 7 天滚动备份
+        2. 保留 7 天滚动备份
         """
         try:
             data = {
@@ -131,7 +132,7 @@ class StrategyEngine:
                 "initial_usdc": self.initial_usdc,
                 "initial_btc": self.initial_btc,
                 "initial_total_usdc": self.initial_total_usdc,
-                "trades": self.trades[-200:],  # 保留最近 200 笔
+                "trades": self.trades[-1000:],  # 保留最近 1000 笔（减少 FIFO 配对截断导致的 PNL 偏差）
                 "total_trades": self.total_trades,
                 "was_trading": self._trading_enabled,  # 重启后自动恢复交易
                 "config": self.cfg,  # 运行时配置（含 API 修改的下限/上限等）
@@ -156,36 +157,11 @@ class StrategyEngine:
                     pass
                 raise
 
-            # git commit（记录变更历史）
-            self._git_save_state()
-
             # 7 天滚动备份
             self._rotate_backup(data)
 
         except Exception as e:
             logger.warning("Failed to save state: %s", e)
-
-    def _git_save_state(self):
-        """git add + commit state.json（保留完整变更历史）"""
-        if not os.path.exists(os.path.join(os.path.dirname(STATE_FILE), ".git")):
-            return
-        try:
-            import subprocess
-            git_dir = os.path.dirname(STATE_FILE)
-            state_rel = os.path.basename(STATE_FILE)
-            # add
-            subprocess.run(
-                ["git", "add", state_rel],
-                cwd=git_dir, capture_output=True, timeout=10,
-            )
-            # commit（允许空提交不做）
-            subprocess.run(
-                ["git", "commit", "-m",
-                 f"state: anchor={self.anchor_price} trades={self.total_trades}"],
-                cwd=git_dir, capture_output=True, timeout=10,
-            )
-        except Exception as e:
-            logger.warning("git save state error: %s", e)
 
     def _rotate_backup(self, data):
         """保留 7 天的 state 滚动备份（按日期）"""
@@ -219,7 +195,7 @@ class StrategyEngine:
                 return None
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-            if data.get("anchor_price", 0) > 0:
+            if isinstance(data, dict):
                 return data
         except Exception:
             pass
@@ -643,6 +619,7 @@ class StrategyEngine:
                 if bal is not None and float(bal) >= 0:
                     old = self.btc_balance
                     self.btc_balance = float(bal)
+                    self._last_ws_balance_update = time.time()
                     if abs(self.btc_balance - old) > 1e-6:
                         logger.info("WS[btc]: %.6f -> %.6f", old, self.btc_balance)
                     if self.btc_index_price > 0:
@@ -652,6 +629,7 @@ class StrategyEngine:
                 if bal is not None and float(bal) >= 0:
                     old = self.usdc_balance
                     self.usdc_balance = float(bal)
+                    self._last_ws_balance_update = time.time()
                     if abs(self.usdc_balance - old) > 1e-6:
                         logger.info("WS[usdc]: %.2f -> %.2f", old, self.usdc_balance)
                     if self.btc_index_price > 0:
@@ -684,6 +662,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     _INDEX_REST_INTERVAL = 15  # 指数价 REST 备用拉取间隔（秒）
+    _BALANCE_REST_INTERVAL = 30  # 余额 REST 备用拉取间隔（秒，WS 静默断流时回退）
     _last_index_rest_ts = 0.0
 
     def _update_index_price(self):
@@ -712,9 +691,11 @@ class StrategyEngine:
         WS 不可用时 fallback REST。
         """
         if self._ws_enabled and self._ws and self._ws.connected and self._ws.authenticated:
-            # WS 在线，不调 REST，余额已由 _on_ws_message 实时更新
-            self.api_connected = True
-            return {"usdc_balance": self.usdc_balance, "btc_balance": self.btc_balance}
+            # WS 在线，但余额推送可能静默中断：超过阈值则回 REST 刷新
+            if time.time() - self._last_ws_balance_update < self._BALANCE_REST_INTERVAL:
+                self.api_connected = True
+                return {"usdc_balance": self.usdc_balance, "btc_balance": self.btc_balance}
+            # WS 余额疑似过期，fall through 到 REST 兜底
         # WS 不可用，REST fallback
         try:
             usdc = self.api.get_account_summary(currency="USDC")
@@ -796,8 +777,8 @@ class StrategyEngine:
 
     def _recalc_thresholds(self):
         rv = self.daily_rv  # 用完整日化 RV 设通道宽度
-        self.upper_threshold = round(self.anchor_price * (1 + rv))   # tick_size=1
-        self.lower_threshold = round(self.anchor_price * (1 - rv))
+        self.upper_threshold = self._round_price(self.anchor_price * (1 + rv))
+        self.lower_threshold = self._round_price(self.anchor_price * (1 - rv))
 
     def _manage_maker_orders(self):
         """每轮循环维护一对 maker 限价单：
@@ -932,7 +913,7 @@ class StrategyEngine:
         for o in self.open_orders:
             target = buy_price if o["side"] == "buy" else sell_price
             if o["order_id"] == self._our_buy_id or o["order_id"] == self._our_sell_id:
-                if abs(o["price"] - target) > 0.5:
+                if abs(o["price"] - target) > self.cfg.get("stale_threshold", 0.5):
                     r = self.api.cancel_order(o["order_id"])
                     if not r["success"]:
                         self._route_api_error("cancel", r, o.get("side"))
@@ -942,6 +923,20 @@ class StrategyEngine:
                         self._our_sell_id = None
                     self._log_info("Cancelled stale %s order at %.2f (target %.2f)",
                                    o["side"], o["price"], target)
+
+        # --- 孤儿单清理：交易所滞留、引擎未追踪、且已偏离目标价的本策略挂单 ---
+        stale_th = self.cfg.get("stale_threshold", 0.5)
+        for o in self.open_orders:
+            oid = o["order_id"]
+            if oid == self._our_buy_id or oid == self._our_sell_id:
+                continue
+            target_px = buy_price if o["side"] == "buy" else sell_price
+            if abs(o["price"] - target_px) > stale_th:
+                r = self.api.cancel_order(oid)
+                if not r["success"]:
+                    self._route_api_error("cancel", r, o.get("side"))
+                self._log_info("Cancelled orphan %s order %s at %.2f (target %.2f)",
+                               o["side"], oid, o["price"], target_px)
 
         # --- 冷静期：成交后 3 分钟内不挂新单（但成交检测照常进行）---
         if time.time() < self._cooldown_until:

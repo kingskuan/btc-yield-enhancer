@@ -336,6 +336,7 @@ def api_params():
                 "rv_update_interval_minutes": cfg.get("rv_update_interval_minutes", 60),
                 "poll_interval": cfg["poll_interval"],
                 "cooldown_seconds": cfg.get("cooldown_seconds", 60),
+                "stale_threshold": cfg.get("stale_threshold", 0.5),
                 "min_poll_balance_usdc": cfg["min_poll_balance_usdc"],
             })
 
@@ -367,6 +368,7 @@ def api_params():
             "rv_min": (0.0001, 0.05),
             "rv_max": (0.001, 0.1),
             "min_poll_balance_usdc": (10, 10000),
+            "stale_threshold": (0.05, 5.0),
         }
         for key, (lo, hi) in param_ranges_float.items():
             if key in data:
