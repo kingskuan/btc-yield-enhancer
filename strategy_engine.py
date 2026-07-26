@@ -237,6 +237,12 @@ class StrategyEngine:
         cs_str = f"{self.contract_size:.10f}".rstrip("0").rstrip(".")
         decimals = max(0, len(cs_str.split(".")[1]) if "." in cs_str else 0)
         return round(raw, decimals)
+    def _round_price(self, price: float) -> float:
+        """按 tick_size 取整价格（BTC=1, ETH=0.1）"""
+        if self.tick_size <= 0:
+            return round(price, 1)
+        decimals = max(0, round(-math.log10(self.tick_size)))
+        return round(round(price / self.tick_size) * self.tick_size, decimals)
 
     def _fetch_instrument_info(self):
         try:
@@ -804,15 +810,15 @@ class StrategyEngine:
         if anchor <= 0 or self.daily_rv <= 0:
             return
 
-        buy_price = round(self.lower_threshold)  # tick_size=1 → 整数
-        sell_price = round(self.upper_threshold)
+        buy_price = self._round_price(self.lower_threshold)
+        sell_price = self._round_price(self.upper_threshold)
         trade_size = self.cfg["trade_size_usdc"]
 
         # 获取当前所有挂单的 ID 集合，以及按价格索引
         current_ids = {o["order_id"] for o in self.open_orders}
         orders_by_price = {}
         for o in self.open_orders:
-            orders_by_price.setdefault(o["side"], {})[round(o["price"])] = o["order_id"]
+            orders_by_price.setdefault(o.get("side"), {})[round(o.get("price"))] = o.get("order_id")
 
         # --- 防重复兜底：交易所已有同价位的挂单，但我们没追踪 → 认领回来 ---
         for side, our_attr, target_price in [
@@ -899,7 +905,11 @@ class StrategyEngine:
                 # 取消对侧挂单（价位已经变了）
                 other_id = self._our_buy_id if side_key == "sell" else self._our_sell_id
                 if other_id:
-                    self.api.cancel_order(other_id)
+                    r = self.api.cancel_order(other_id)
+                    if not r["success"]:
+                        self._route_api_error(
+                            "cancel", r, "buy" if side_key == "sell" else "sell"
+                        )
                     setattr(self, "_our_buy_id" if side_key == "sell" else "_our_sell_id", None)
                 # --- 方案A（后继）：成交后检查新锚点是否偏离当前指数价，偏离则继续追 ---
                 idx = self.btc_index_price
@@ -915,15 +925,17 @@ class StrategyEngine:
                         self._cooldown_until = time.time() + self._cooldown_seconds
                         self._log_info("方案A: Cooldown %ds", self._cooldown_seconds)
                         # 对侧挂单已在成交处理中取消，此处无需重复 cancel
-                        buy_price = round(self.lower_threshold)
-                        sell_price = round(self.upper_threshold)
+                        buy_price = self._round_price(self.lower_threshold)
+                        sell_price = self._round_price(self.upper_threshold)
 
         # --- 取消价位不对的挂单 ---
         for o in self.open_orders:
             target = buy_price if o["side"] == "buy" else sell_price
             if o["order_id"] == self._our_buy_id or o["order_id"] == self._our_sell_id:
                 if abs(o["price"] - target) > 0.5:
-                    self.api.cancel_order(o["order_id"])
+                    r = self.api.cancel_order(o["order_id"])
+                    if not r["success"]:
+                        self._route_api_error("cancel", r, o.get("side"))
                     if o["order_id"] == self._our_buy_id:
                         self._our_buy_id = None
                     else:
@@ -968,7 +980,7 @@ class StrategyEngine:
                     self._our_buy_id = parsed["order_id"]
                     self._log_info("Buy maker placed: ID %s", self._our_buy_id)
                 else:
-                    self._log_info("Buy maker FAILED: %s", result.get("error"))
+                    self._route_api_error("buy", result, "buy")
             else:
                 self._log_info("Buy skipped: USDC insufficient (need %.2f have %.2f)",
                                buy_amount * buy_price, self.usdc_balance)
@@ -1005,7 +1017,7 @@ class StrategyEngine:
                     self._our_sell_id = parsed["order_id"]
                     self._log_info("Sell maker placed: ID %s", self._our_sell_id)
                 else:
-                    self._log_info("Sell maker FAILED: %s", result.get("error"))
+                    self._route_api_error("sell", result, "sell")
             else:
                 self._log_info("Sell skipped: BTC insufficient (need %.6f have %.6f)",
                                sell_amount, self.btc_balance)
@@ -1037,8 +1049,38 @@ class StrategyEngine:
     def _add_error(self, msg):
         with self._lock:
             self.errors.append({"time": datetime.now(BJT).isoformat(), "msg": msg})
-            if len(self.errors) > 100:
-                self.errors = self.errors[-100:]
+        if len(self.errors) > 100:
+            self.errors = self.errors[-100:]
 
+    def _route_api_error(self, op: str, result: dict, side: Optional[str] = None):
+        """参考 ccxt 错误分级，把 API 失败按类别分流处理。
+
+            - insufficient_funds: 挂起对应方向的余额不足标志（余额轮询会重置）
+            - auth:               记入仪表盘 errors（致命，需人工排查）
+            - rate_limit / exchange_not_available / exchange_error: 已在请求层退避重试，仅日志
+            - order_not_found:    视为已处理（订单已不存在）
+            - 其他:               记入仪表盘 errors
+            """
+        if not result or result.get("success"):
+            return
+        category = result.get("error_category", "unknown")
+        code = result.get("error_code")
+        err = result.get("error")
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        self._log_info("%s FAILED [%s] code=%s: %s", op, category, code, msg)
+
+        if category == "insufficient_funds":
+            if side == "buy":
+                self.usdc_insufficient = True
+            elif side == "sell":
+                self.btc_insufficient = True
+        elif category == "auth":
+            self._add_error(f"认证失败({code}): {msg}")
+        elif category in ("rate_limit", "exchange_not_available", "exchange_error"):
+            pass  # 已在请求层退避重试
+        elif category == "order_not_found":
+            pass  # 视为已处理
+        else:
+            self._add_error(f"{op} error[{category}]: {msg}")
     def _log_info(self, fmt, *args):
         logger.info(fmt, *args)
