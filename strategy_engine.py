@@ -4,7 +4,7 @@ BTC 收益增强策略引擎 v2
 核心逻辑（产品定义）：
 1. 启动时扫描 USDC + BTC 余额，记录初始总值
 2. 以当前指数价作为价格锚（不额外买入 BTC）
-3. 计算 30 天日化 RV，限幅 1%~5%，每天 16:00 BJT 后更新
+3. 计算近 1 小时日化 RV，限幅 0.5%~5%，每 15 分钟更新
 4. 价格涨过锚 × (1 + RV) → 卖出 200U 等值 BTC
    价格跌破锚 × (1 - RV) → 买入 200U 等值 BTC
 5. 成交后更新锚为成交均价
@@ -38,8 +38,8 @@ DEFAULT_CONFIG = {
     "rv_max": 0.05,        # 日化 RV 上限 5.0%
     "rv_update_interval_minutes": 15,  # RV 更新间隔（分钟，兜底用；成交/方案A触发实时更新）
     "poll_interval": 30,
-    "cooldown_seconds": 60,
-    "stale_threshold": 0.5,          # 交易冷却期（秒）
+    "cooldown_seconds": 180,
+    "stale_threshold": 0.5,          # 挂单偏移撤单阈值（USDC）
     "instrument_name": "BTC_USDC",
     "index_name": "btc_usdc",
     "min_poll_balance_usdc": 200,   # 资金保护阈值 $200
@@ -96,6 +96,8 @@ class StrategyEngine:
         self.total_pnl = 0.0
         self.total_trades = 0
         self.btc_cost_basis = 0.0
+        self.realized_pnl = 0.0          # 累计已实现交易盈亏（增量维护，不依赖 trades 历史长度）
+        self.buy_inventory = []          # 未平仓买入库存 FIFO: [[amount, price], ...]
         self._cooldown_until = 0.0        # 防频繁交易的冷却时间（秒时间戳）
         # cooldown 直接读 self.cfg.get("cooldown_seconds", 180)（方案2 已移除冗余缓存变量 _cooldown_seconds）
         self._trading_enabled = False      # 交易开关：就绪后默认不交易，用户点击"启动"才开
@@ -132,7 +134,9 @@ class StrategyEngine:
                 "initial_usdc": self.initial_usdc,
                 "initial_btc": self.initial_btc,
                 "initial_total_usdc": self.initial_total_usdc,
-                "trades": self.trades[-1000:],  # 保留最近 1000 笔（减少 FIFO 配对截断导致的 PNL 偏差）
+                "trades": self.trades[-200:],  # 保留最近 200 笔用于前端展示
+                "realized_pnl": self.realized_pnl,       # 累计已实现盈亏（不截断）
+                "buy_inventory": self.buy_inventory,     # 未平仓买入库存（不截断，PNL 计算依赖）
                 "total_trades": self.total_trades,
                 "was_trading": self._trading_enabled,  # 重启后自动恢复交易
                 "config": self.cfg,  # 运行时配置（含 API 修改的下限/上限等）
@@ -350,9 +354,10 @@ class StrategyEngine:
                     "trade_size_usdc": self.cfg["trade_size_usdc"],
                     "rv_min": self.cfg["rv_min"],
                     "rv_max": self.cfg["rv_max"],
-                    "rv_update_interval_minutes": self.cfg.get("rv_update_interval_minutes", 60),
+                    "rv_update_interval_minutes": self.cfg.get("rv_update_interval_minutes", 15),
                     "poll_interval": self.cfg["poll_interval"],
-                    "cooldown_seconds": self.cfg.get("cooldown_seconds", 60),
+                    "cooldown_seconds": self.cfg.get("cooldown_seconds", 180),
+                    "stale_threshold": self.cfg.get("stale_threshold", 0.5),
                     "min_poll_balance_usdc": self.cfg["min_poll_balance_usdc"],
                     "instrument_name": self.cfg["instrument_name"],
                     "testnet": self.testnet,
@@ -360,24 +365,26 @@ class StrategyEngine:
             }
 
     def _calc_trading_pnl(self):
-        """FIFO 配对买卖，计算已实现的交易盈亏"""
-        buy_q = [t["price"] for t in self.trades if t["side"] == "buy"]
-        sell_q = [t for t in self.trades if t["side"] == "sell"]
-        btc_left = [t["amount_btc"] for t in self.trades if t["side"] == "buy"]
-        pnl = 0.0
-        bi = 0
-        for s in sell_q:
-            amt_s = s["amount_btc"]
-            while amt_s > 0.000001 and bi < len(btc_left):
-                pair = min(btc_left[bi], amt_s)
-                cost = pair * buy_q[bi]
-                revenue = pair * s["price"]
-                pnl += revenue - cost
-                btc_left[bi] -= pair
-                amt_s -= pair
-                if btc_left[bi] < 0.000001:
-                    bi += 1
-        return round(pnl, 2)
+        """返回累计已实现交易盈亏（由每笔成交增量维护，不依赖 trades 历史长度）"""
+        return round(self.realized_pnl, 2)
+
+    def _recompute_inventory_from_trades(self):
+        """从 trades 历史重建 realized_pnl 与 buy_inventory（兼容旧 state 无该字段）"""
+        self.realized_pnl = 0.0
+        self.buy_inventory = []
+        for t in self.trades:
+            if t["side"] == "buy":
+                self.buy_inventory.append([t["amount_btc"], t["price"]])
+            else:
+                remaining = t["amount_btc"]
+                while remaining > 1e-6 and self.buy_inventory:
+                    lot = self.buy_inventory[0]
+                    take = min(lot[0], remaining)
+                    self.realized_pnl += take * (t["price"] - lot[1])
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 1e-6:
+                        self.buy_inventory.pop(0)
 
     # ------------------------------------------------------------------
     # 主循环
@@ -471,28 +478,41 @@ class StrategyEngine:
             return False
         self.btc_index_price = price
 
-        # 4. 锚点 + 初始值：优先恢复上次保存的值，首次部署才 snapshot
+        # 4. 状态恢复：交易记录与初始值无条件恢复；锚点按可用性恢复
         saved = self._load_state()
-        if saved and abs(saved["anchor_price"] - price) / price < 0.10:
-            self.anchor_price = saved["anchor_price"]
-            self.initial_usdc = saved.get("initial_usdc", bal["usdc_balance"])
-            self.initial_btc = saved.get("initial_btc", bal["btc_balance"])
-            self.initial_total_usdc = saved.get("initial_total_usdc",
-                bal["usdc_balance"] + bal["btc_balance"] * price)
-            # 恢复历史交易记录
+        if saved:
+            # —— 交易记录：无条件恢复（与锚点价格无关）——
             old_trades = saved.get("trades", [])
             if old_trades:
                 self.trades = old_trades
                 self.total_trades = saved.get("total_trades", len(old_trades))
                 logger.info("Restored %d trades from saved state", len(old_trades))
-            logger.info("Anchor restored from saved state: %.2f (current price: %.2f)",
-                        self.anchor_price, price)
+            # 恢复已实现盈亏与买入库存（兼容旧 state 无该字段）
+            if "realized_pnl" in saved and "buy_inventory" in saved:
+                self.realized_pnl = float(saved.get("realized_pnl", 0.0))
+                self.buy_inventory = [list(x) for x in saved.get("buy_inventory", [])]
+            else:
+                self._recompute_inventory_from_trades()
+            # 初始值：恢复（用于 PNL 计算），缺失则用当前余额兜底
+            self.initial_usdc = saved.get("initial_usdc", bal["usdc_balance"])
+            self.initial_btc = saved.get("initial_btc", bal["btc_balance"])
+            self.initial_total_usdc = saved.get("initial_total_usdc",
+                bal["usdc_balance"] + bal["btc_balance"] * price)
             # 重启后自动恢复交易状态
             if saved.get("was_trading"):
                 self._trading_enabled = True
                 logger.info("Trading auto-resumed from saved state")
+            # —— 锚点：仅在保存锚与当前价偏差 <10% 时恢复，否则用当前指数价 ——
+            if saved.get("anchor_price", 0) > 0 and abs(saved["anchor_price"] - price) / price < 0.10:
+                self.anchor_price = saved["anchor_price"]
+                logger.info("Anchor restored from saved state: %.2f (current price: %.2f)",
+                            self.anchor_price, price)
+            else:
+                self.anchor_price = price
+                logger.info("Anchor set to current index price: %.2f (saved anchor not reusable)",
+                            price)
         else:
-            # 首次部署或 state 坏了：用当前 balance snapshot 作为初始值
+            # 首次部署或 state 损坏：用当前 balance snapshot 作为初始值
             if self.initial_total_usdc == 0:
                 self.initial_usdc = bal["usdc_balance"]
                 self.initial_btc = bal["btc_balance"]
@@ -521,7 +541,7 @@ class StrategyEngine:
     # ------------------------------------------------------------------
 
     def _check_rv_update(self):
-        """每小时更新一次 RV"""
+        """按 rv_update_interval_minutes 间隔更新 RV"""
         if not self.last_rv_update:
             self._update_rv()
             return
@@ -796,10 +816,13 @@ class StrategyEngine:
         trade_size = self.cfg["trade_size_usdc"]
 
         # 获取当前所有挂单的 ID 集合，以及按价格索引
-        current_ids = {o["order_id"] for o in self.open_orders}
+        current_ids = {o.get("order_id") for o in self.open_orders}
         orders_by_price = {}
         for o in self.open_orders:
-            orders_by_price.setdefault(o.get("side"), {})[round(o.get("price"))] = o.get("order_id")
+            side = o.get("side")
+            price = o.get("price")
+            if side and price is not None:
+                orders_by_price.setdefault(side, {})[round(price)] = o.get("order_id")
 
         # --- 防重复兜底：交易所已有同价位的挂单，但我们没追踪 → 认领回来 ---
         for side, our_attr, target_price in [
@@ -868,8 +891,23 @@ class StrategyEngine:
                 self._update_rv()
                 self._recalc_thresholds()
                 self._fetch_balances()
-                # 记录成交
+                # 记录成交 + 增量维护库存与已实现盈亏
                 with self._lock:
+                    if side_key == "buy":
+                        self.buy_inventory.append([round(trade_amount, 6), fill_price])
+                    else:
+                        # 卖出：FIFO 配对买入库存，实现盈亏
+                        remaining = trade_amount
+                        while remaining > 1e-6 and self.buy_inventory:
+                            lot = self.buy_inventory[0]
+                            take = min(lot[0], remaining)
+                            self.realized_pnl += take * (fill_price - lot[1])
+                            lot[0] -= take
+                            remaining -= take
+                            if lot[0] <= 1e-6:
+                                self.buy_inventory.pop(0)
+                        if remaining > 1e-6:
+                            self._log_info("Sell %.6f exceeds buy inventory, partial PNL skipped", remaining)
                     self.trades.append({
                         "id": f"{'B' if side_key == 'buy' else 'S'}{int(time.time())}",
                         "time": datetime.now(BJT).isoformat(),
@@ -882,6 +920,9 @@ class StrategyEngine:
                         "label": "maker",
                     })
                     self.total_trades += 1
+                    # 内存 trades 上限（PNL 已增量维护，历史仅展示用）
+                    if len(self.trades) > 500:
+                        self.trades = self.trades[-500:]
                 self._save_state()
                 # 取消对侧挂单（价位已经变了）
                 other_id = self._our_buy_id if side_key == "sell" else self._our_sell_id
@@ -959,7 +1000,7 @@ class StrategyEngine:
         # --- 挂买入单（防重复：检查交易所是否已有同价位挂单）---
         buy_amount = calc_amount(buy_price)
         buy_exists = any(
-            o["side"] == "buy" and abs(o["price"] - buy_price) < 0.5
+            o["side"] == "buy" and abs(o["price"] - buy_price) < self.cfg.get("stale_threshold", 0.5)
             for o in self.open_orders
         )
         if not self._our_buy_id and not buy_exists and buy_amount > 0 and not self.usdc_insufficient:
@@ -996,7 +1037,7 @@ class StrategyEngine:
         # --- 挂卖出单（防重复：检查交易所是否已有同价位挂单）---
         sell_amount = calc_amount(sell_price)
         sell_exists = any(
-            o["side"] == "sell" and abs(o["price"] - sell_price) < 0.5
+            o["side"] == "sell" and abs(o["price"] - sell_price) < self.cfg.get("stale_threshold", 0.5)
             for o in self.open_orders
         )
         if not self._our_sell_id and not sell_exists and sell_amount > 0 and not self.btc_insufficient:
