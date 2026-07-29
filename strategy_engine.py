@@ -30,7 +30,9 @@ from deribit_ws import DeribitWSClient
 logger = logging.getLogger(__name__)
 
 BJT = timezone(timedelta(hours=8))
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
 DEFAULT_CONFIG = {
     "trade_size_usdc": 100.0,
