@@ -27,7 +27,8 @@ def _setup_logging():
     pythonw 下 stdout 被重定向到 os.devnull, 控制台 handler 无效但无害；
     关键是所有模块日志都通过 root logger 写入 btc.log, 解决可观测性缺口。
     """
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    data_dir = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(data_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "btc.log")
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
