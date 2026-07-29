@@ -117,11 +117,8 @@ USE_TESTNET = os.environ.get("DERIBIT_TESTNET", "1") == "1"
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 
 if not DERIBIT_CLIENT_ID or not DERIBIT_CLIENT_SECRET:
-    raise RuntimeError(
-        "请设置环境变量 DERIBIT_ID 和 DERIBIT_SECRET\n"
-        "Linux/Mac: export DERIBIT_ID=xxx && export DERIBIT_SECRET=xxx\n"
-        "Windows:   set DERIBIT_ID=xxx && set DERIBIT_SECRET=xxx\n"
-        "或在项目根目录创建 .env 文件"
+    logger.warning(
+        "DERIBIT_ID / DERIBIT_SECRET 未设置——启动后请通过仪表盘或 Railway Variables 补充凭证。"
     )
 
 # ---------------------------------------------------------------------------
@@ -209,6 +206,12 @@ def _require_token():
 # ---------------------------------------------------------------------------
 # 页面路由
 # ---------------------------------------------------------------------------
+
+@app.route("/healthz")
+def healthz():
+    """Liveness probe — always 200 as long as the web process is up."""
+    return jsonify({"ok": True, "service": "btc-yield-enhancer"})
+
 
 @app.route("/")
 @app.route("/btc-enhancer/")
@@ -548,8 +551,10 @@ def api_config():
 # 入口
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5050"))
+    host = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
     print("=" * 60)
     print("  BTC 收益增强策略 - Dashboard + WebSocket")
-    print("  http://localhost:5050")
+    print(f"  http://{host}:{port}")
     print("=" * 60)
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    app.run(host=host, port=port, debug=False)
