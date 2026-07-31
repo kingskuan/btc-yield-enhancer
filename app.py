@@ -133,6 +133,43 @@ engine_lock = threading.Lock()
 ws_clients = set()         # 已连接的 WebSocket 客户端
 ws_clients_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# 容器启动自恢复：有凭证就自动 initialize() + 交易开关随 state.json 恢复
+# ---------------------------------------------------------------------------
+# 关闭开关：AUTO_INIT=0 (默认开)。仅在 gunicorn worker / __main__ 里跑, 不影响单测。
+def _auto_init_engine():
+    """后台线程启动引擎, 不阻塞 gunicorn 主流程 / healthz。
+
+    - 无凭证 → 直接跳过, 等仪表盘手动配置
+    - 有凭证 → StrategyEngine.initialize() → _data_loop 会读 state.json
+      如果 was_trading=True 就自动恢复交易 (逻辑在 strategy_engine._init_strategy)
+    """
+    global engine
+    if not DERIBIT_CLIENT_ID or not DERIBIT_CLIENT_SECRET:
+        logger.info("auto-init skipped: 没有 Deribit 凭证")
+        return
+    try:
+        with engine_lock:
+            if engine is not None:
+                return
+            engine = StrategyEngine(
+                DERIBIT_CLIENT_ID, DERIBIT_CLIENT_SECRET,
+                testnet=USE_TESTNET,
+                state_callback=on_state_update,
+            )
+            if not engine.initialize():
+                logger.error("auto-init: engine.initialize() 返回 False")
+                engine = None
+                return
+        logger.info("auto-init: engine 已启动 (was_trading 由 state.json 决定是否交易)")
+    except Exception as e:
+        logger.exception("auto-init 异常: %s", e)
+
+
+if os.environ.get("AUTO_INIT", "1") != "0":
+    threading.Thread(target=_auto_init_engine, daemon=True, name="auto-init").start()
+
 # ---------------------------------------------------------------------------
 # WebSocket 广播
 # ---------------------------------------------------------------------------
