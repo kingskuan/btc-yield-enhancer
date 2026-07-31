@@ -167,8 +167,7 @@ def _auto_init_engine():
         logger.exception("auto-init 异常: %s", e)
 
 
-if os.environ.get("AUTO_INIT", "1") != "0":
-    threading.Thread(target=_auto_init_engine, daemon=True, name="auto-init").start()
+# 实际启动线程放在文件末尾, 见 _kickoff_auto_init()
 
 # ---------------------------------------------------------------------------
 # WebSocket 广播
@@ -583,6 +582,13 @@ def api_config():
             engine.cfg["instrument_name"] = data["instrument_name"]
             changed.append(f"instrument_name={data['instrument_name']}")
     return jsonify({"success": True, "changed": changed})
+
+
+# ---------------------------------------------------------------------------
+# 模块加载完成后触发 auto-init (放这里而不是靠上面, 保证 on_state_update 等回调已定义)
+# ---------------------------------------------------------------------------
+if os.environ.get("AUTO_INIT", "1") != "0":
+    threading.Thread(target=_auto_init_engine, daemon=True, name="auto-init").start()
 
 
 # ---------------------------------------------------------------------------
