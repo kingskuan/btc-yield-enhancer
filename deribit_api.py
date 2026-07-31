@@ -51,7 +51,9 @@ DERIBIT_ERROR_CATEGORY: dict = {
     # 资金不足（InsufficientFunds）：不可重试，挂起对应方向
     10009: "insufficient_funds",
     # 订单不存在（OrderNotFound）：视为已处理
+    # 11044 not_open_order：订单已成交/已撤，撤单请求晚了一步（常见良性竞态）
     10004: "order_not_found", 10010: "order_not_found", 10029: "order_not_found",
+    11044: "order_not_found",
     # 订单参数非法（含 tick/精度错误 InvalidOrder）：不可重试，属代码缺陷
     10002: "invalid_order", 10003: "invalid_order", 10005: "invalid_order",
     10006: "invalid_order", 10007: "invalid_order", 10008: "invalid_order",
@@ -62,7 +64,7 @@ DERIBIT_ERROR_CATEGORY: dict = {
     10036: "invalid_order", 10043: "invalid_order", 10044: "invalid_order",
     10045: "invalid_order", 10046: "invalid_order", 11008: "invalid_order",
     11036: "invalid_order", 11038: "invalid_order", 11039: "invalid_order",
-    11041: "invalid_order", 11044: "invalid_order", 11054: "invalid_order",
+    11041: "invalid_order", 11054: "invalid_order",
     # 参数错误（含 tick 精度 / JSON-RPC 参数 BadRequest）：不可重试
     11029: "bad_request", 11037: "bad_request", 11043: "bad_request",
     11045: "bad_request", 11046: "bad_request", 11047: "bad_request",
@@ -199,7 +201,37 @@ class DeribitClient:
                     timeout=20,
                 )
                 if resp.status_code != 200:
-                    # 网关 / 5xx：视为瞬时，退避后重试
+                    # Deribit 在 4xx/某些 5xx 下也会返回带 JSON-RPC error 的 body
+                    # (e.g. 400 + code=11044 not_open_order 良性竞态)。
+                    # 先尝试解析出业务错误分类, 不是所有 4xx 都要重试。
+                    parsed_err = None
+                    try:
+                        _body = resp.json()
+                        if isinstance(_body, dict) and _body.get("error"):
+                            parsed_err = _body["error"]
+                    except ValueError:
+                        pass
+                    if parsed_err is not None:
+                        code, category, is_retryable, msg = _classify_error(parsed_err)
+                        log_level = logging.INFO if category == "order_not_found" else logging.WARNING
+                        logger.log(
+                            log_level,
+                            "Deribit HTTP %d [%s] code=%s cat=%s: %s",
+                            resp.status_code, method, code, category, msg,
+                        )
+                        last_result = {
+                            "success": False,
+                            "error": parsed_err,
+                            "error_code": code,
+                            "error_category": category,
+                            "is_retryable": is_retryable,
+                            "http_status": resp.status_code,
+                        }
+                        if is_retryable and attempt < max_retries - 1:
+                            time.sleep(_backoff(attempt))
+                            continue
+                        return last_result
+                    # 没有解析出业务错误 → 视为瞬时(网关/5xx)，退避后重试
                     logger.warning(
                         "Deribit HTTP %d [%s] attempt %d: %s",
                         resp.status_code, method, attempt + 1, resp.text[:200],
